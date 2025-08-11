@@ -5,86 +5,132 @@ on:
     types: [created]
 
 permissions:
-  contents: read       # 读代码
-  issues: write        # 回帖
-  pull-requests: write
+  contents: read         # 只读代码
+  issues: write          # 回评论
+
+concurrency:
+  group: repo-assistant-${{ github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
-  show_or_ls:
-    # 只允许仓库成员/协作者触发，且只处理 /show 和 /ls 命令
+  assist:
+    # 只响应 /ls 和 /show；且仅限 OWNER/MEMBER/COLLABORATOR；忽略 bot
     if: >
-      (startsWith(github.event.comment.body, '/show ') ||
-       startsWith(github.event.comment.body, '/ls ')) &&
       (github.event.comment.author_association == 'OWNER' ||
        github.event.comment.author_association == 'MEMBER' ||
        github.event.comment.author_association == 'COLLABORATOR')
+      && !startsWith(github.event.comment.user.login, 'github-actions')
+      && (contains(github.event.comment.body, '/ls') || contains(github.event.comment.body, '/show'))
     runs-on: ubuntu-latest
+
     steps:
-      - name: Run command
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Handle /ls and /show
         uses: actions/github-script@v7
         with:
           script: |
             const {owner, repo} = context.repo;
-            const issue_number = context.issue.number;
-            const body = context.payload.comment.body.trim();
+            const issue_number = context.payload.issue.number;
+            const raw = context.payload.comment.body || '';
 
-            async function comment(text) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number, body: text
-              });
+            function reply(md) {
+              return github.rest.issues.createComment({ owner, repo, issue_number, body: md });
             }
 
-            // 取默认分支
-            const repoInfo = await github.rest.repos.get({owner, repo});
-            const ref = repoInfo.data.default_branch;
+            // 允许的文件后缀（防止把二进制/巨文件贴出来）
+            const ALLOW_EXT = new Set(['.md','.txt','.py','.json','.yaml','.yml','.toml','.ini','.cfg','.gitignore']);
+            const MAX_BYTES = 64 * 1024;     // /show 最多返回 64KB
+            const MAX_LINES = 400;
+            const MAX_LIST  = 200;           // /ls 最多列 200 项
 
-            if (body.startsWith('/ls ')) {
-              const path = body.slice(4).trim() || '.';
+            const path = require('path');
+            const fs   = require('fs');
+            const cp   = require('child_process');
+
+            function norm(p) {
+              // 统一、去掉开头的/，禁止 ..、\0 等
+              p = (p || '').trim().replace(/^\/+/, '').replace(/\\+/g,'/');
+              if (p.includes('..') || p.startsWith('.git') || p.includes('\0')) return null;
+              return p || '.'; // 空表示根
+            }
+
+            // 只取第一条命令处理（避免洪泛）；支持：
+            //   /ls [path]
+            //   /show <file>[:start-end]
+            const lines = raw.split(/\r?\n/).map(s=>s.trim());
+            const cmdline = lines.find(x => x.startsWith('/ls') || x.startsWith('/show'));
+            if (!cmdline) { core.info('no command'); return; }
+
+            if (cmdline.startsWith('/ls')) {
+              const m = cmdline.match(/^\/ls(?:\s+(.+))?$/);
+              let target = norm(m?.[1] ?? '.');
+              if (!target) { await reply('读取目录失败：路径不合法'); return; }
+
+              // 用 git 列目录，保证只列已跟踪文件
+              let out = '';
               try {
-                const res = await github.rest.repos.getContent({owner, repo, path, ref});
-                if (!Array.isArray(res.data)) {
-                  await comment(`\`${path}\` 不是目录。`);
-                  return;
-                }
-                const rows = res.data
-                  .map(e => `${e.type === 'dir' ? '📁' : '📄'} ${e.name}`)
-                  .join('\n');
-                await comment(`**目录 ${path} (@${ref})**\n\n${rows || '_空_'}\n`);
+                // ls-tree 对目录会给出条目清单；对文件给出单条
+                out = cp.execSync(`git ls-tree --name-only HEAD -- "${target}"`, {encoding:'utf8'});
               } catch (e) {
-                await comment(`读取目录失败：${e.message}`);
+                await reply('读取目录失败：Not Found');
+                return;
               }
+
+              const items = out.split(/\r?\n/).filter(Boolean).slice(0, MAX_LIST);
+              const tree = items.map(s => `- ${s}`).join('\n') || '_空_';
+              await reply(`目录 \`${target}\` (@main)\n\n${tree}`);
               return;
             }
 
-            if (body.startsWith('/show ')) {
-              // 格式：/show path/to/file[:start-end]
-              const arg = body.slice(6).trim();
-              let m = arg.match(/^(.+?):(\d+)-(\d+)$/);
-              let path, start, end;
-              if (m) { path = m[1]; start = +m[2]; end = +m[3]; }
-              else { path = arg; }
+            if (cmdline.startsWith('/show')) {
+              // 语法：/show path/to/file[:start-end]
+              const m = cmdline.match(/^\/show\s+(.+)$/);
+              let arg = m?.[1]?.trim();
+              if (!arg) { await reply('读取文件失败：参数缺失'); return; }
 
-              try {
-                const res = await github.rest.repos.getContent({owner, repo, path, ref});
-                if (Array.isArray(res.data) || res.data.type !== 'file') {
-                  await comment(`\`${path}\` 不是普通文件。`);
-                  return;
-                }
-                const content = Buffer.from(res.data.content, res.data.encoding).toString('utf8');
-                let out = content;
-                if (start && end) {
-                  const lines = content.split('\n');
-                  const s = Math.max(1, start);
-                  const e = Math.min(lines.length, end);
-                  out = lines.slice(s-1, e).map((l, i) => `${s+i}  ${l}`).join('\n');
-                }
-                // 限制一次返回的长度，避免超长评论
-                const MAX = 55000;
-                if (out.length > MAX) out = out.slice(0, MAX) + '\n... (截断)';
+              let range = null;
+              const rm = arg.match(/^(.*?):(\d+)-(\d+)$/);
+              if (rm) { arg = rm[1]; range = [parseInt(rm[2]), parseInt(rm[3])]; }
+              const file = norm(arg);
+              if (!file) { await reply('读取文件失败：路径不合法'); return; }
 
-                await comment(`**${path} @ ${ref}**\n\n\`\`\`\n${out}\n\`\`\``);
-              } catch (e) {
-                await comment(`读取文件失败：${e.message}`);
+              const ext = path.extname(file).toLowerCase();
+              if (!ALLOW_EXT.has(ext)) { await reply(`读取文件失败：不允许的后缀 \`${ext}\``); return; }
+
+              if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+                await reply('读取文件失败：Not Found'); return;
               }
+
+              let text = fs.readFileSync(file, 'utf8');
+              // 限制大小
+              if (Buffer.byteLength(text, 'utf8') > MAX_BYTES) {
+                text = text.slice(0, MAX_BYTES) + `\n...（已截断，超过 ${MAX_BYTES} bytes）`;
+              }
+
+              let lang = ext.replace(/^\./,'') || '';
+              let allLines = text.split(/\r?\n/);
+
+              if (range) {
+                const [a,b] = range;
+                if (a >= 1 && b >= a && a <= allLines.length) {
+                  text = allLines.slice(a-1, Math.min(b, allLines.length)).join('\n');
+                }
+              } else {
+                // 默认也做个行数上限
+                if (allLines.length > MAX_LINES) {
+                  text = allLines.slice(0, MAX_LINES).join('\n') + `\n...（已截断，超过 ${MAX_LINES} 行）`;
+                }
+              }
+
+              await reply([
+                `\`${file}\` @ main`,
+                '',
+                '```' + (lang || '') ,
+                text,
+                '```'
+              ].join('\n'));
               return;
             }
