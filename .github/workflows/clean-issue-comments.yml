@@ -1,0 +1,79 @@
+name: Clean bot comments
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: housekeeping
+  cancel-in-progress: true
+
+jobs:
+  clean:
+    # 只允许仓库成员/协作者触发；只在 /cleanbot 指令时执行
+    if: |
+      startsWith(github.event.comment.body, '/cleanbot') &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse keep count
+        id: parse
+        run: |
+          body="${{ github.event.comment.body }}"
+          # 取数字参数，默认 20
+          if [[ "$body" =~ ^/cleanbot[[:space:]]+([0-9]+) ]]; then
+            echo "keep=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+          else
+            echo "keep=20" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete old bot comments
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const keep = parseInt("${{ steps.parse.outputs.keep }}", 10) || 20;
+            const issue_number = context.payload.issue?.number || context.payload.pull_request?.number;
+            if (!issue_number) {
+              core.info('No issue number, exit.');
+              return;
+            }
+
+            // 拉满（最多 100*10=1000 条）
+            let page = 1, all = [];
+            while (page <= 10) {
+              const { data } = await github.rest.issues.listComments({
+                ...context.repo, issue_number, per_page: 100, page
+              });
+              all = all.concat(data);
+              if (data.length < 100) break;
+              page++;
+            }
+
+            // 仅删 github-actions 机器人的旧评论
+            const botNames = new Set(['github-actions[bot]', 'github-actions']);
+            const botComments = all.filter(c => botNames.has(c.user?.login));
+
+            if (botComments.length <= keep) {
+              core.info(`Bot comments ${botComments.length} <= keep ${keep}, nothing to do.`);
+              return;
+            }
+
+            // 按创建时间从新到旧排序，保留前 keep 条
+            botComments.sort((a,b)=> new Date(b.created_at)-new Date(a.created_at));
+            const toDelete = botComments.slice(keep);
+
+            core.info(`Deleting ${toDelete.length} old bot comments, keep ${keep}.`);
+            for (const c of toDelete) {
+              await github.rest.issues.deleteComment({
+                ...context.repo, comment_id: c.id
+              });
+            }
