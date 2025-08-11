@@ -1,18 +1,15 @@
 name: Apply Patch From Comment
-
 on:
   issue_comment:
     types: [created]
-  # 可选：手动触发（用于测试）
   workflow_dispatch:
-
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
   apply:
-    # 更宽松的触发条件：三种写法都能触发
+    # 宽松触发：支持 ```patch / ```diff / 纯文本 diff --git
     if: ${{ contains(github.event.comment.body, '```patch') || contains(github.event.comment.body, '```diff') || contains(github.event.comment.body, 'diff --git') }}
     runs-on: ubuntu-latest
     steps:
@@ -23,23 +20,21 @@ jobs:
         run: |
           echo "Actor: ${{ github.actor }}"
           echo "Action: ${{ github.event.action }}"
-          echo "Starts with:"
-          echo "${{ github.event.comment.body }}" | head -n 5
+          echo "---- First lines of comment ----"
+          echo "${{ github.event.comment.body }}" | head -n 10
 
       - name: Extract patch
         run: |
           python - <<'PY'
-          import json, os, re, sys
+          import json, os, re
           ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
           body = ev["comment"]["body"]
-          # 先找 ```patch/```diff 代码块
           m = re.search(r"```(?:patch|diff)\s*(.*?)\s*```", body, re.S)
-          # 找不到就退化为从 diff --git 开始的全部
           if not m:
               m = re.search(r"(diff --git.*)", body, re.S)
           assert m, "No patch content found"
           open("chat.patch","w",encoding="utf-8").write(m.group(1))
-          print("Wrote chat.patch with", len(m.group(1)), "bytes")
+          print("Wrote chat.patch")
           PY
 
       - name: Configure git auth
