@@ -5,132 +5,128 @@ on:
     types: [created]
 
 permissions:
-  contents: read         # 只读代码
-  issues: write          # 回评论
+  contents: write
+  pull-requests: write
+  issues: read
 
 concurrency:
-  group: repo-assistant-${{ github.event.issue.number }}
-  cancel-in-progress: false
+  group: repo-assistant
+  cancel-in-progress: true
 
 jobs:
-  assist:
-    # 只响应 /ls 和 /show；且仅限 OWNER/MEMBER/COLLABORATOR；忽略 bot
+  run:
+    # 只在 “patch-inbox” 这个收件箱 issue（#1）里响应；
+    # 只对 OWNER/MEMBER/COLLABORATOR 生效；
+    # 只响应 /ls /show /write 三类命令。
     if: >
-      (github.event.comment.author_association == 'OWNER' ||
-       github.event.comment.author_association == 'MEMBER' ||
-       github.event.comment.author_association == 'COLLABORATOR')
-      && !startsWith(github.event.comment.user.login, 'github-actions')
-      && (contains(github.event.comment.body, '/ls') || contains(github.event.comment.body, '/show'))
+      github.event.issue.number == 1 &&
+      ( contains(github.event.comment.body, '/ls') ||
+        contains(github.event.comment.body, '/show') ||
+        contains(github.event.comment.body, '/write') ) &&
+      ( github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR' )
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Handle /ls and /show
+      - name: Handle commands
         uses: actions/github-script@v7
+        env:
+          BODY: ${{ github.event.comment.body }}
         with:
           script: |
-            const {owner, repo} = context.repo;
-            const issue_number = context.payload.issue.number;
-            const raw = context.payload.comment.body || '';
-
-            function reply(md) {
-              return github.rest.issues.createComment({ owner, repo, issue_number, body: md });
-            }
-
-            // 允许的文件后缀（防止把二进制/巨文件贴出来）
-            const ALLOW_EXT = new Set(['.md','.txt','.py','.json','.yaml','.yml','.toml','.ini','.cfg','.gitignore']);
-            const MAX_BYTES = 64 * 1024;     // /show 最多返回 64KB
-            const MAX_LINES = 400;
-            const MAX_LIST  = 200;           // /ls 最多列 200 项
-
+            const { context, github } = require('@actions/github');
+            const core = require('@actions/core');
+            const fs = require('fs');
             const path = require('path');
-            const fs   = require('fs');
-            const cp   = require('child_process');
+            const { execSync } = require('child_process');
 
-            function norm(p) {
-              // 统一、去掉开头的/，禁止 ..、\0 等
-              p = (p || '').trim().replace(/^\/+/, '').replace(/\\+/g,'/');
-              if (p.includes('..') || p.startsWith('.git') || p.includes('\0')) return null;
-              return p || '.'; // 空表示根
+            const issue = context.issue;
+            const body = (process.env.BODY || '').trim();
+
+            async function reply(md) {
+              await github.rest.issues.createComment({ ...issue, body: md });
             }
+            function bad(msg) { return reply(`读取失败： ${msg}`); }
 
-            // 只取第一条命令处理（避免洪泛）；支持：
-            //   /ls [path]
-            //   /show <file>[:start-end]
-            const lines = raw.split(/\r?\n/).map(s=>s.trim());
-            const cmdline = lines.find(x => x.startsWith('/ls') || x.startsWith('/show'));
-            if (!cmdline) { core.info('no command'); return; }
+            // ---------- /ls ----------
+            if (body.startsWith('/ls')) {
+              const p = body.replace('/ls','').trim() || '.';
+              if (p.includes('..')) return bad('路径不允许包含 ..');
+              if (!fs.existsSync(p)) return bad('Not Found');
 
-            if (cmdline.startsWith('/ls')) {
-              const m = cmdline.match(/^\/ls(?:\s+(.+))?$/);
-              let target = norm(m?.[1] ?? '.');
-              if (!target) { await reply('读取目录失败：路径不合法'); return; }
-
-              // 用 git 列目录，保证只列已跟踪文件
-              let out = '';
-              try {
-                // ls-tree 对目录会给出条目清单；对文件给出单条
-                out = cp.execSync(`git ls-tree --name-only HEAD -- "${target}"`, {encoding:'utf8'});
-              } catch (e) {
-                await reply('读取目录失败：Not Found');
-                return;
-              }
-
-              const items = out.split(/\r?\n/).filter(Boolean).slice(0, MAX_LIST);
-              const tree = items.map(s => `- ${s}`).join('\n') || '_空_';
-              await reply(`目录 \`${target}\` (@main)\n\n${tree}`);
+              // 更友好的列表
+              const out = execSync(`ls -la --group-directories-first "${p}"`, {encoding:'utf8'});
+              await reply(`目录 \`${p}\` (@${context.ref?.split('/').pop() || 'main'})\n\n\`\`\`\n${out}\n\`\`\``);
               return;
             }
 
-            if (cmdline.startsWith('/show')) {
-              // 语法：/show path/to/file[:start-end]
-              const m = cmdline.match(/^\/show\s+(.+)$/);
-              let arg = m?.[1]?.trim();
-              if (!arg) { await reply('读取文件失败：参数缺失'); return; }
+            // ---------- /show path[:start-end] ----------
+            if (body.startsWith('/show ')) {
+              let arg = body.slice(6).trim();
+              if (!arg) return bad('格式：/show path[:start-end]');
+              if (arg.includes('..')) return bad('路径不允许包含 ..');
 
               let range = null;
-              const rm = arg.match(/^(.*?):(\d+)-(\d+)$/);
-              if (rm) { arg = rm[1]; range = [parseInt(rm[2]), parseInt(rm[3])]; }
-              const file = norm(arg);
-              if (!file) { await reply('读取文件失败：路径不合法'); return; }
-
-              const ext = path.extname(file).toLowerCase();
-              if (!ALLOW_EXT.has(ext)) { await reply(`读取文件失败：不允许的后缀 \`${ext}\``); return; }
-
-              if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
-                await reply('读取文件失败：Not Found'); return;
+              const m = arg.match(/:(\d+)(?:-(\d+))?$/);
+              if (m) {
+                range = { s: +m[1], e: +(m[2] || m[1]) };
+                arg = arg.slice(0, arg.lastIndexOf(':'));
               }
+              if (!fs.existsSync(arg)) return bad('Not Found');
+              let lines = fs.readFileSync(arg,'utf8').split(/\r?\n/);
+              if (range) lines = lines.slice(range.s-1, range.e);
 
-              let text = fs.readFileSync(file, 'utf8');
-              // 限制大小
-              if (Buffer.byteLength(text, 'utf8') > MAX_BYTES) {
-                text = text.slice(0, MAX_BYTES) + `\n...（已截断，超过 ${MAX_BYTES} bytes）`;
-              }
-
-              let lang = ext.replace(/^\./,'') || '';
-              let allLines = text.split(/\r?\n/);
-
-              if (range) {
-                const [a,b] = range;
-                if (a >= 1 && b >= a && a <= allLines.length) {
-                  text = allLines.slice(a-1, Math.min(b, allLines.length)).join('\n');
-                }
-              } else {
-                // 默认也做个行数上限
-                if (allLines.length > MAX_LINES) {
-                  text = allLines.slice(0, MAX_LINES).join('\n') + `\n...（已截断，超过 ${MAX_LINES} 行）`;
-                }
-              }
-
-              await reply([
-                `\`${file}\` @ main`,
-                '',
-                '```' + (lang || '') ,
-                text,
-                '```'
-              ].join('\n'));
+              const lang = arg.split('.').pop();
+              await reply(`\`${arg}\` @ ${context.payload.repository.default_branch}\n\n\`\`\`${lang}\n${lines.join('\n')}\n\`\`\``);
               return;
             }
+
+            // ---------- /write path + code block ----------
+            // 示例：
+            // /write utils/example.py
+            // ```py
+            // print("hi")
+            // ```
+            if (body.startsWith('/write')) {
+              const m = body.match(/^\/write\s+([^\n]+)\n+```([\w+-]*)\n([\s\S]*?)\n```/m);
+              if (!m) {
+                return bad('格式不正确。示例：\n`/write utils/a.py`\n```py\nprint("hi")\n```');
+              }
+              const p = m[1].trim();
+              const lang = m[2].trim();
+              const content = m[3];
+
+              if (p.includes('..')) return bad('路径不允许包含 ..');
+              if (Buffer.byteLength(content,'utf8') > 200 * 1024) return bad('内容过大（>200KB）');
+
+              fs.mkdirSync(path.dirname(p), { recursive: true });
+              fs.writeFileSync(p, content, 'utf8');
+
+              const BR = `write-${Date.now()}`;
+              execSync(`git config user.name  "chat-bot"`);
+              execSync(`git config user.email "chat-bot@users.noreply.github.com"`);
+              execSync(`git checkout -b "${BR}"`);
+              execSync(`git add "${p}"`);
+              execSync(`git commit -m "write ${p} from chat"`);
+              execSync(`git push --set-upstream origin "${BR}"`);
+
+              const pr = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: BR,
+                base: context.payload.repository.default_branch,
+                title: `Write ${p} from chat`,
+                body: 'Auto-created from issue comment.',
+                maintainer_can_modify: true
+              });
+              await reply(`已创建 PR：${pr.data.html_url}`);
+              return;
+            }
+
+            await reply('未识别到命令（支持：`/ls`、`/show`、`/write`）。');
