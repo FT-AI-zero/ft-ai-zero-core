@@ -5,9 +5,9 @@ on:
     types: [created]
 
 permissions:
-  contents: write          # 需要写入分支
-  pull-requests: write     # 需要开 PR
-  issues: write            # 回评论
+  contents: write        # 需要写入分支
+  pull-requests: write   # 需要开 PR
+  issues: write          # 回评论
 
 concurrency:
   group: patch-inbox
@@ -15,16 +15,13 @@ concurrency:
 
 jobs:
   edit:
-    # 仅 OWNER/MEMBER/COLLABORATOR；忽略 bot；只在包含 /write 时触发
+    # 仅 OWNER / MEMBER / COLLABORATOR，且必须包含 /write
     if: >
-      (
-        github.event.comment.author_association == 'OWNER' ||
-        github.event.comment.author_association == 'MEMBER' ||
-        github.event.comment.author_association == 'COLLABORATOR'
-      )
-      && !endsWith(github.event.comment.user.login, '[bot]')
-      && !startsWith(github.event.comment.user.login, 'github-actions')
-      && contains(github.event.comment.body, '/write ')
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+      && contains(github.event.comment.body, '/write')
+      && github.event.comment.user.type != 'Bot'
     runs-on: ubuntu-latest
 
     steps:
@@ -35,87 +32,83 @@ jobs:
       - name: Apply /write and open PR
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const issue_number = context.payload.issue.number;
             const author = context.payload.comment.user.login;
-            const body = context.payload.comment.body || '';
+            const body   = context.payload.comment.body || '';
 
-            const say = (md) =>
-              github.rest.issues.createComment({ owner, repo, issue_number, body: md });
+            const say = (md) => github.rest.issues.createComment({ owner, repo, issue_number, body: md });
 
             const path = require('path');
             const fs   = require('fs');
             const cp   = require('child_process');
 
-            // 允许写入的后缀与顶级目录（避免写二进制/工作流）
-            const ALLOW_EXT = new Set([
-              '.md','.txt','.py','.json','.yaml','.yml','.toml','.ini','.cfg'
-            ]);
-            const ALLOW_TOP = new Set([
-              'core','utils','scripts','jobs','strategy','collectors','ailearning','data','' // '' 表示根目录
-            ]);
+            // 允许的顶级目录与后缀（避免写二进制/工作流）
+            const ALLOW_TOP = new Set(['', '.', 'core','utils','scripts','jobs','strategy','collectors','ailearning','data']);
+            const ALLOW_EXT = new Set(['.md','.txt','.py','.json','.yaml','.yml','.toml','.ini','.cfg','.gitignore']);
             const MAX_BYTES = 64 * 1024;
 
-            // 解析：
-            //   /write path/to/file
-            //   ```lang
-            //   文件内容...
-            //   ```
-            const header = body.match(/^\/write\s+([^\s]+)\s*$/m);
-            const fence  = body.match(/```[a-zA-Z0-9_-]*\n([\s\S]*?)\n```/m);
+            // 解析 "/write path"（允许两边留白）
+            const header = body.match(/^\s*\/write\s+(.+?)\s*$/m);
+            // 解析 ```lang\r?\n ... \r?\n```
+            const fence  = body.match(/```[^\r\n]*\r?\n([\s\S]*?)\r?\n```/);
+
             if (!header || !fence) {
               await say('用法：\n```\n/write path/to/file\n```lang\n<内容>\n```\n（会创建分支并发起 PR）');
               return;
             }
 
-            function norm(p){
-              p = (p || '').trim().replace(/^\/+/, '').replace(/\\+/g,'/');
-              if (p.includes('..') || p.startsWith('.git') || p.startsWith('.github/') || p.includes('\0')) return null;
+            // 规范化与校验路径
+            function norm(p) {
+              p = String(p).trim().replace(/^\/+/, '').replace(/\\+/g, '/');
+              if (!p || p.includes('..') || p.startsWith('.git') || p.startsWith('.github/')) return null;
               return p;
             }
-
             const rel = norm(header[1]);
             if (!rel) { await say('写入失败：路径不合法'); return; }
 
-            // 顶级目录判定：有斜杠取第一段；无斜杠代表根目录（''）
-            const parts = rel.split('/');
-            const top = (parts.length > 1) ? parts[0] : '';
+            const top = rel.split('/')[0] || '';
             if (!ALLOW_TOP.has(top)) {
-              await say(`写入失败：只允许根目录或这些顶级目录：${Array.from(ALLOW_TOP).filter(Boolean).join(', ')}`);
+              await say(`写入失败：只允许根目录或这些顶级目录：${Array.from(ALLOW_TOP).join(', ')}`);
               return;
             }
 
-            // 扩展名判定，单独允许 .gitignore
             const ext = path.extname(rel).toLowerCase();
-            const isGitignore = rel.endsWith('.gitignore');
-            if (!isGitignore && !ALLOW_EXT.has(ext)) {
-              await say(`写入失败：不允许的后缀 \`${ext || '(无扩展名)'}\``);
+            if (!ALLOW_EXT.has(ext)) {
+              await say(`写入失败：不允许的后缀 \`${ext}\``);
               return;
             }
 
-            let content = fence[1];
+            const content = fence[1];
             if (Buffer.byteLength(content, 'utf8') > MAX_BYTES) {
               await say(`写入失败：内容超过 ${MAX_BYTES} bytes`);
               return;
             }
 
-            // 写入到工作区 → 新分支 → 提交 → 推送 → 开 PR
-            const br = `chat-edit-${Date.now()}`;
-            cp.execSync(`git checkout -b ${br}`, {stdio:'inherit'});
+            // 新分支 -> 写入 -> 提交 -> 推送 -> 开 PR
+            const br  = `chat-edit-${Date.now()}`;
             const abs = path.resolve(process.cwd(), rel);
-            fs.mkdirSync(path.dirname(abs), {recursive: true});
+
+            cp.execSync(`git checkout -b ${br}`, { stdio: 'inherit' });
+            fs.mkdirSync(path.dirname(abs), { recursive: true });
             fs.writeFileSync(abs, content, 'utf8');
 
-            cp.execSync('git config user.name "chat-bot"', {stdio:'inherit'});
-            cp.execSync('git config user.email "chat-bot@users.noreply.github.com"', {stdio:'inherit'});
-            cp.execSync(`git add -- "${rel}"`, {stdio:'inherit'});
-            cp.execSync(`git commit -m "edit: ${rel} (via /write by ${author})"`, {stdio:'inherit'});
-            cp.execSync(`git push origin ${br}`, {stdio:'inherit'});
+            cp.execSync('git config user.name "chat-bot"', { stdio: 'inherit' });
+            cp.execSync('git config user.email "chat-bot@users.noreply.github.com"', { stdio: 'inherit' });
+            cp.execSync(`git add -- "${rel}"`, { stdio: 'inherit' });
 
-            // 默认分支作为 base
-            const info = await github.rest.repos.get({owner, repo});
+            // 如果没有变化就给出提示
+            try {
+              cp.execSync(`git diff --cached --quiet -- "${rel}"`);
+              await say(`没有变化：\`${rel}\``);
+              return;
+            } catch {}
+
+            cp.execSync(`git commit -m "edit: ${rel} (via /write by ${author})"`, { stdio: 'inherit' });
+            cp.execSync(`git push origin ${br}`, { stdio: 'inherit' });
+
+            const info = await github.rest.repos.get({ owner, repo });
             const base = info.data.default_branch;
 
             const pr = await github.rest.pulls.create({
