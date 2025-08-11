@@ -5,128 +5,227 @@ on:
     types: [created]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: read
+  contents: read
+  issues: write
+  actions: read
 
 concurrency:
   group: repo-assistant
   cancel-in-progress: true
 
 jobs:
-  run:
-    # 只在 “patch-inbox” 这个收件箱 issue（#1）里响应；
-    # 只对 OWNER/MEMBER/COLLABORATOR 生效；
-    # 只响应 /ls /show /write 三类命令。
+  assist:
     if: >
-      github.event.issue.number == 1 &&
-      ( contains(github.event.comment.body, '/ls') ||
-        contains(github.event.comment.body, '/show') ||
-        contains(github.event.comment.body, '/write') ) &&
-      ( github.event.comment.author_association == 'OWNER' ||
-        github.event.comment.author_association == 'MEMBER' ||
-        github.event.comment.author_association == 'COLLABORATOR' )
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+      && !contains(github.event.comment.user.login, 'github-actions')
+      && (
+        startsWith(github.event.comment.body, '/scan') ||
+        startsWith(github.event.comment.body, '/tree') ||
+        startsWith(github.event.comment.body, '/grep ') ||
+        startsWith(github.event.comment.body, '/dump ')
+      )
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Handle commands
+      - id: parse
+        name: Parse command
+        run: |
+          BODY=$(jq -r .comment.body "$GITHUB_EVENT_PATH")
+          CMD=""; ARG=""
+          if echo "$BODY" | grep -qE '^/scan(\s|$)'; then CMD=scan; fi
+          if echo "$BODY" | grep -qE '^/tree(\s|$)'; then
+            CMD=tree
+            ARG=$(printf "%s" "$BODY" | sed -n 's#^/tree[[:space:]]\+\(.*\)$#\1#p')
+          fi
+          if echo "$BODY" | grep -qE '^/grep[[:space:]]+'; then
+            CMD=grep
+            ARG=$(printf "%s" "$BODY" | sed -n 's#^/grep[[:space:]]\+\(.*\)$#\1#p')
+          fi
+          if echo "$BODY" | grep -qE '^/dump[[:space:]]+'; then
+            CMD=dump
+            ARG=$(printf "%s" "$BODY" | sed -n 's#^/dump[[:space:]]\+\(.*\)$#\1#p')
+          fi
+          echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
+          echo "arg=$ARG" >> "$GITHUB_OUTPUT"
+
+      # ---------- /tree ----------
+      - name: Make tree
+        if: steps.parse.outputs.cmd == 'tree'
+        run: |
+          PYTHONUNBUFFERED=1 python - <<'PY'
+          import os, sys, json
+          arg = os.getenv('ARG','').strip()
+          root = arg if arg else '.'
+          root = root.strip('/')
+
+          lines=[]
+          for dirpath, dirnames, filenames in os.walk(root):
+            # 忽略.git
+            dirnames[:] = [d for d in dirnames if d != '.git']
+            rel = dirpath if dirpath!='.' else ''
+            lines.append(f"[{rel or '.'}]")
+            for d in sorted(dirnames):  lines.append(f"  {d}/")
+            for f in sorted(filenames): lines.append(f"  {f}")
+            if len(lines) > 2000: break
+          open('tree.txt','w',encoding='utf-8').write("\n".join(lines))
+          PY
+      - name: Comment tree
+        if: steps.parse.outputs.cmd == 'tree'
         uses: actions/github-script@v7
-        env:
-          BODY: ${{ github.event.comment.body }}
         with:
           script: |
-            const { context, github } = require('@actions/github');
-            const core = require('@actions/core');
             const fs = require('fs');
-            const path = require('path');
-            const { execSync } = require('child_process');
+            const body = fs.readFileSync('tree.txt','utf8');
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              body: '目录：\n```\n' + body + '\n```'
+            });
 
-            const issue = context.issue;
-            const body = (process.env.BODY || '').trim();
+      # ---------- /grep ----------
+      - name: Grep
+        if: steps.parse.outputs.cmd == 'grep'
+        run: |
+          PATTERN="${{ steps.parse.outputs.arg }}"
+          grep -RIn --exclude-dir=.git --binary-files=without-match "$PATTERN" . | head -n 2000 > grep.txt || true
+      - name: Comment grep
+        if: steps.parse.outputs.cmd == 'grep'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let out = fs.existsSync('grep.txt') ? fs.readFileSync('grep.txt','utf8') : '';
+            if (!out.trim()) out = '(无匹配或结果过长已截断)';
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              body: '搜索结果（前2000行）：\n```\n' + out + '\n```'
+            });
 
-            async function reply(md) {
-              await github.rest.issues.createComment({ ...issue, body: md });
-            }
-            function bad(msg) { return reply(`读取失败： ${msg}`); }
-
-            // ---------- /ls ----------
-            if (body.startsWith('/ls')) {
-              const p = body.replace('/ls','').trim() || '.';
-              if (p.includes('..')) return bad('路径不允许包含 ..');
-              if (!fs.existsSync(p)) return bad('Not Found');
-
-              // 更友好的列表
-              const out = execSync(`ls -la --group-directories-first "${p}"`, {encoding:'utf8'});
-              await reply(`目录 \`${p}\` (@${context.ref?.split('/').pop() || 'main'})\n\n\`\`\`\n${out}\n\`\`\``);
-              return;
-            }
-
-            // ---------- /show path[:start-end] ----------
-            if (body.startsWith('/show ')) {
-              let arg = body.slice(6).trim();
-              if (!arg) return bad('格式：/show path[:start-end]');
-              if (arg.includes('..')) return bad('路径不允许包含 ..');
-
-              let range = null;
-              const m = arg.match(/:(\d+)(?:-(\d+))?$/);
-              if (m) {
-                range = { s: +m[1], e: +(m[2] || m[1]) };
-                arg = arg.slice(0, arg.lastIndexOf(':'));
-              }
-              if (!fs.existsSync(arg)) return bad('Not Found');
-              let lines = fs.readFileSync(arg,'utf8').split(/\r?\n/);
-              if (range) lines = lines.slice(range.s-1, range.e);
-
-              const lang = arg.split('.').pop();
-              await reply(`\`${arg}\` @ ${context.payload.repository.default_branch}\n\n\`\`\`${lang}\n${lines.join('\n')}\n\`\`\``);
-              return;
-            }
-
-            // ---------- /write path + code block ----------
-            // 示例：
-            // /write utils/example.py
-            // ```py
-            // print("hi")
-            // ```
-            if (body.startsWith('/write')) {
-              const m = body.match(/^\/write\s+([^\n]+)\n+```([\w+-]*)\n([\s\S]*?)\n```/m);
-              if (!m) {
-                return bad('格式不正确。示例：\n`/write utils/a.py`\n```py\nprint("hi")\n```');
-              }
-              const p = m[1].trim();
-              const lang = m[2].trim();
-              const content = m[3];
-
-              if (p.includes('..')) return bad('路径不允许包含 ..');
-              if (Buffer.byteLength(content,'utf8') > 200 * 1024) return bad('内容过大（>200KB）');
-
-              fs.mkdirSync(path.dirname(p), { recursive: true });
-              fs.writeFileSync(p, content, 'utf8');
-
-              const BR = `write-${Date.now()}`;
-              execSync(`git config user.name  "chat-bot"`);
-              execSync(`git config user.email "chat-bot@users.noreply.github.com"`);
-              execSync(`git checkout -b "${BR}"`);
-              execSync(`git add "${p}"`);
-              execSync(`git commit -m "write ${p} from chat"`);
-              execSync(`git push --set-upstream origin "${BR}"`);
-
-              const pr = await github.rest.pulls.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                head: BR,
-                base: context.payload.repository.default_branch,
-                title: `Write ${p} from chat`,
-                body: 'Auto-created from issue comment.',
-                maintainer_can_modify: true
+      # ---------- /dump ----------
+      - name: Dump file
+        if: steps.parse.outputs.cmd == 'dump'
+        run: |
+          p="${{ steps.parse.outputs.arg }}"
+          p="${p#./}"
+          if [ ! -f "$p" ]; then echo "NOTFOUND" > dump.txt; exit 0; fi
+          BYTES=$(wc -c < "$p")
+          if [ "$BYTES" -le 102400 ]; then
+            printf "OK_INLINE\n" > dump.txt
+            printf "%s\n" "$p" > dump_path.txt
+            cat "$p" > dump_content.txt
+          else
+            mkdir dump && cp "$p" "dump/$(basename "$p")"
+          fi
+      - name: Upload dump artifact
+        if: steps.parse.outputs.cmd == 'dump' && (!cancelled() && !failure())
+        uses: actions/upload-artifact@v4
+        with:
+          name: dump-file
+          path: dump/
+          if-no-files-found: ignore
+      - name: Comment dump
+        if: steps.parse.outputs.cmd == 'dump'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issue_number = context.payload.issue.number;
+            if (fs.existsSync('dump.txt') && fs.readFileSync('dump.txt','utf8').startsWith('OK_INLINE')) {
+              const path = fs.readFileSync('dump_path.txt','utf8').trim();
+              const content = fs.readFileSync('dump_content.txt','utf8');
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number,
+                body: `**${path}**：\n\`\`\`\n${content}\n\`\`\``
               });
-              await reply(`已创建 PR：${pr.data.html_url}`);
-              return;
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number,
+                body: `文件较大或二进制，已作为 artifact 上传（见本次运行的 Artifacts）。`
+              });
             }
 
-            await reply('未识别到命令（支持：`/ls`、`/show`、`/write`）。');
+      # ---------- /scan ----------
+      - name: Setup Python
+        if: steps.parse.outputs.cmd == 'scan'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install tools
+        if: steps.parse.outputs.cmd == 'scan'
+        run: |
+          pip install -q ruff bandit radon pip-audit
+      - name: Run scan
+        if: steps.parse.outputs.cmd == 'scan'
+        run: |
+          python - <<'PY'
+          import os, sys, json, subprocess, pathlib
+          os.makedirs('reports', exist_ok=True)
+          # 目录树
+          out=[]
+          for dp, dns, fns in os.walk('.'):
+              dns[:] = [d for d in dns if d != '.git']
+              out.append(dp)
+              for f in fns: out.append(f"  {f}")
+              if len(out)>5000: break
+          open('reports/tree.txt','w',encoding='utf8').write("\n".join(out))
+
+          def run(cmd, outpath):
+              print('>>', ' '.join(cmd))
+              try:
+                  subprocess.run(cmd, check=False, stdout=open(outpath,'w',encoding='utf8'), stderr=subprocess.STDOUT)
+              except Exception as e:
+                  open(outpath,'w').write(str(e))
+
+          run(['ruff','check','.'], 'reports/ruff.txt')
+          run(['bandit','-r','.', '-f','json'], 'reports/bandit.json')
+          run(['radon','cc','-s','-a','-j','.'], 'reports/radon-cc.json')
+          run(['radon','mi','-s','-j','.'], 'reports/radon-mi.json')
+          if os.path.exists('requirements.txt'):
+              run(['pip-audit','-r','requirements.txt','-f','json'], 'reports/pip-audit.json')
+          # TODO/敏感词
+          run(['grep','-RIn','-E','TODO|FIXME|HACK','--exclude-dir=.git','.'], 'reports/todo.txt')
+          PY
+      - name: Upload reports
+        if: steps.parse.outputs.cmd == 'scan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-scan-reports
+          path: reports/
+      - name: Comment summary
+        if: steps.parse.outputs.cmd == 'scan'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const read = p => fs.existsSync(p)? fs.readFileSync(p,'utf8'): '';
+            const ruff = read('reports/ruff.txt');
+            const todo = read('reports/todo.txt');
+            const bandit = (() => { try { return JSON.parse(read('reports/bandit.json')); } catch { return {results: []}; } })();
+            const vulns = (() => { try { return JSON.parse(read('reports/pip-audit.json')); } catch { return []; } })();
+            const sev = bandit.results?.reduce((m,r)=>{ m[r.issue_severity]=(m[r.issue_severity]||0)+1; return m; },{}) || {};
+            const topRuff = ruff.split('\n').slice(0,20).join('\n');
+            const todoHead = (todo||'').split('\n').slice(0,20).join('\n');
+            let body = [
+              '### 夜间扫描完成',
+              '- 工具：ruff / bandit / radon / pip-audit',
+              '- 产物：**repo-scan-reports** artifact（可下载查看详版）',
+              '',
+              '**Bandit 严重级别计数**： ' + JSON.stringify(sev),
+              '',
+              '**Ruff 前20条**:',
+              '```', topRuff, '```',
+              '',
+              '**TODO/FIXME 前20条**:',
+              '```', todoHead, '```',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              body
+            });
