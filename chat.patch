@@ -1,0 +1,8 @@
+diff --git a/TEST_PATCH_OK.txt b/TEST_PATCH_OK.txt
+new file mode 100644
+index 0000000..3b18e13
+--- /dev/null
++++ b/TEST_PATCH_OK.txt
+@@ -0,0 +1,2 @@
++This file confirms the patch workflow works.
++OK to proceed.
