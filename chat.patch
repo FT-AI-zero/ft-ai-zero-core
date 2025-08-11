@@ -1,0 +1,8 @@
+diff --git a/PR_OK_002.txt b/PR_OK_002.txt
+new file mode 100644
+index 0000000..3b18e13
+--- /dev/null
++++ b/PR_OK_002.txt
+@@ -0,0 +1,2 @@
++This file proves the PR path.
++OK to proceed.
