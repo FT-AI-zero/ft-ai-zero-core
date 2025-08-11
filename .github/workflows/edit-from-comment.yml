@@ -12,23 +12,17 @@ permissions:
 concurrency:
   group: patch-inbox
   cancel-in-progress: true
-# …
-if: >
-  (你的触发条件) &&
-  (
-    github.event.comment.author_association == 'OWNER' ||
-    github.event.comment.author_association == 'MEMBER' ||
-    github.event.comment.author_association == 'COLLABORATOR'
-  )
-
 
 jobs:
   edit:
     # 仅 OWNER/MEMBER/COLLABORATOR；忽略 bot；只在包含 /write 时触发
     if: >
-      (github.event.comment.author_association == 'OWNER' ||
-       github.event.comment.author_association == 'MEMBER' ||
-       github.event.comment.author_association == 'COLLABORATOR')
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+      && !endsWith(github.event.comment.user.login, '[bot]')
       && !startsWith(github.event.comment.user.login, 'github-actions')
       && contains(github.event.comment.body, '/write ')
     runs-on: ubuntu-latest
@@ -41,21 +35,27 @@ jobs:
       - name: Apply /write and open PR
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const {owner, repo} = context.repo;
+            const { owner, repo } = context.repo;
             const issue_number = context.payload.issue.number;
             const author = context.payload.comment.user.login;
             const body = context.payload.comment.body || '';
 
-            function say(md){ return github.rest.issues.createComment({owner, repo, issue_number, body: md}); }
+            const say = (md) =>
+              github.rest.issues.createComment({ owner, repo, issue_number, body: md });
 
             const path = require('path');
             const fs   = require('fs');
             const cp   = require('child_process');
 
-            // 允许写入的后缀与目录（避免写二进制/工作流）
-            const ALLOW_EXT = new Set(['.md','.txt','.py','.json','.yaml','.yml','.toml','.ini','.cfg','.gitignore']);
-            const ALLOW_TOP = new Set(['core','utils','scripts','jobs','strategy','collectors','ailearning','data','.', '']); // 根或这些一层
+            // 允许写入的后缀与顶级目录（避免写二进制/工作流）
+            const ALLOW_EXT = new Set([
+              '.md','.txt','.py','.json','.yaml','.yml','.toml','.ini','.cfg'
+            ]);
+            const ALLOW_TOP = new Set([
+              'core','utils','scripts','jobs','strategy','collectors','ailearning','data','' // '' 表示根目录
+            ]);
             const MAX_BYTES = 64 * 1024;
 
             // 解析：
@@ -79,11 +79,21 @@ jobs:
             const rel = norm(header[1]);
             if (!rel) { await say('写入失败：路径不合法'); return; }
 
-            const top = rel.split('/')[0] || '';
-            if (!ALLOW_TOP.has(top)) { await say(`写入失败：只允许根目录或这些顶级目录：${Array.from(ALLOW_TOP).join(', ')}`); return; }
+            // 顶级目录判定：有斜杠取第一段；无斜杠代表根目录（''）
+            const parts = rel.split('/');
+            const top = (parts.length > 1) ? parts[0] : '';
+            if (!ALLOW_TOP.has(top)) {
+              await say(`写入失败：只允许根目录或这些顶级目录：${Array.from(ALLOW_TOP).filter(Boolean).join(', ')}`);
+              return;
+            }
 
+            // 扩展名判定，单独允许 .gitignore
             const ext = path.extname(rel).toLowerCase();
-            if (!ALLOW_EXT.has(ext)) { await say(`写入失败：不允许的后缀 \`${ext}\``); return; }
+            const isGitignore = rel.endsWith('.gitignore');
+            if (!isGitignore && !ALLOW_EXT.has(ext)) {
+              await say(`写入失败：不允许的后缀 \`${ext || '(无扩展名)'}\``);
+              return;
+            }
 
             let content = fence[1];
             if (Buffer.byteLength(content, 'utf8') > MAX_BYTES) {
@@ -104,7 +114,7 @@ jobs:
             cp.execSync(`git commit -m "edit: ${rel} (via /write by ${author})"`, {stdio:'inherit'});
             cp.execSync(`git push origin ${br}`, {stdio:'inherit'});
 
-            // 找默认分支作为 base
+            // 默认分支作为 base
             const info = await github.rest.repos.get({owner, repo});
             const base = info.data.default_branch;
 
