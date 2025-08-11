@@ -68,9 +68,7 @@ SIGNAL_GEN_LOG        = LOG_DIR / "signal_generator.log"
 ORDER_ATTEMPTS_LOG    = LOG_DIR / "order_attempts.log"
 
 # ===== OKX 环境 =====
-OKX_API_KEY    = os.environ.get("OKX_API_KEY",    "8eca9299-48f7-4d88-b5fe-9e05412aa35b")
-OKX_SECRET_KEY = os.environ.get("OKX_SECRET_KEY", "3E492260DB5F3B12721FBCFDC95F962F")
-OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "FREEstyle..007")
+
 
 # ===== SQLite 兼容工具 =====
 def has_table(db_path: Path, table: str) -> bool:
