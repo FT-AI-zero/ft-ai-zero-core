@@ -4,20 +4,17 @@ on:
   issue_comment:
     types: [created]
 
-# 需要写代码 + 开 PR 权限
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
   apply:
-    # 只有包含 ```patch 的评论才触发
-    if: |
-      contains(github.event.comment.body, '```patch') &&
-      (github.event.comment.author_association == 'MEMBER' ||
-       github.event.comment.author_association == 'OWNER'  ||
-       github.event.comment.author_association == 'COLLABORATOR')
-
+    # 仅当评论里包含 ```patch 且评论者是成员/协作者/仓库所有者时触发
+    if: contains(github.event.comment.body, '```patch') &&
+        (github.event.comment.author_association == 'MEMBER' ||
+         github.event.comment.author_association == 'OWNER'  ||
+         github.event.comment.author_association == 'COLLABORATOR')
     runs-on: ubuntu-latest
 
     steps:
@@ -29,20 +26,18 @@ jobs:
       - name: Extract patch from comment
         run: |
           python - <<'PY'
-          import os,re,json
-          with open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8') as f:
-              ev = json.load(f)
-          m = re.search(r"```patch\s*(.*?)```", ev["comment"]["body"], re.S|re.I)
+          import os,re,json,sys
+          ev=json.load(open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8'))
+          m=re.search(r"```patch\s*(.*?)```", ev["comment"]["body"], re.S|re.I)
           assert m, "No ```patch``` block found in the comment"
-          with open("chat.patch","w",encoding="utf-8") as f:
-              f.write(m.group(1))
+          open("chat.patch","w",encoding="utf-8").write(m.group(1))
           PY
 
       - name: Create branch, apply and push
         run: |
           set -e
           BR="chatpatch-$(date +%s)"
-          echo "BRANCH=$BR" >> "$GITHUB_ENV"
+          echo "BRANCH=$BR" >> $GITHUB_ENV
 
           git config user.name  "chat-bot"
           git config user.email "chat-bot@users.noreply.github.com"
@@ -57,22 +52,32 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const { owner, repo } = context.repo;
-
-            // 读取上一步写入到环境变量的分支名
+            const {owner, repo} = context.repo;
             const head = process.env.BRANCH;
             if (!head) { core.setFailed('BRANCH env missing'); return; }
 
-            // 获取默认分支作为 base
+            // 取默认分支作为 base
             const info = await github.rest.repos.get({ owner, repo });
             const base = info.data.default_branch;
 
-            // 创建 PR
+            // 关联当前 issue，PR 合并后可自动关闭
+            const issueNumber = context.payload.issue.number;
+            const title = `Patch from chat (#${issueNumber})`;
+            const body  = `Auto-created from comment on #${issueNumber}.\n\nCloses #${issueNumber}`;
+
             const pr = await github.rest.pulls.create({
-              owner, repo, head, base,
-              title: 'Patch from chat',
-              body: 'Auto-created from issue comment.',
+              owner, repo, head, base, title, body,
               maintainer_can_modify: true,
             });
+
+            // 给 PR 打标签（可选）
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: pr.data.number,
+                labels: ['from-chat']
+              });
+            } catch (e) {
+              core.info('addLabels skipped: ' + e.message);
+            }
 
             core.info(`PR -> ${pr.data.html_url}`);
