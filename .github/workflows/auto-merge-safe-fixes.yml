@@ -1,0 +1,104 @@
+name: Auto-merge Safe Fixes
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [ main ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: auto-merge-safe-fixes
+  cancel-in-progress: true
+
+jobs:
+  guard-and-merge:
+    # 只处理我们机器人开的 PR：head 分支名 & 账户
+    if: >
+      !github.event.pull_request.draft &&
+      (
+        startsWith(github.event.pull_request.head.ref, 'chat-edit-') ||
+        startsWith(github.event.pull_request.head.ref, 'chatpatch-')
+      ) &&
+      (
+        github.event.pull_request.user.login == 'github-actions' ||
+        github.event.pull_request.user.type == 'Bot'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: List changed files
+        id: files
+        uses: tj-actions/changed-files@v45
+
+      - name: Validate whitelist
+        id: validate
+        run: |
+          ALLOW_EXT='md|txt|json'
+          # 顶级允许目录（根、docs、data、README/变更记录等），拒绝 .github/**、脚本、二进制
+          BLOCK_DIRS='^\.github/|^\.git/|^scripts/|^tools/|^jobs/|^utils/|^core/|^collectors/|^ailearning/'
+          BAD=0
+          for f in ${{ steps.files.outputs.all_changed_files }}; do
+            # 禁止目录
+            if echo "$f" | grep -Eiq "$BLOCK_DIRS"; then
+              echo "::error file=$f::Directory not allowed for auto-merge"
+              BAD=1
+              continue
+            fi
+            # 只允许后缀
+            if ! echo "$f" | grep -Eiq "\.($ALLOW_EXT)$"; then
+              echo "::error file=$f::Extension not allowed for auto-merge"
+              BAD=1
+              continue
+            fi
+            # 文件大小限制（64KB）
+            BYTES=$(wc -c < "$f")
+            if [ "$BYTES" -gt 65536 ]; then
+              echo "::error file=$f::File too large ($BYTES bytes)"
+              BAD=1
+            fi
+          done
+          echo "bad=$BAD" >> "$GITHUB_OUTPUT"
+          [ "$BAD" -eq 0 ] || exit 1
+
+      - name: Run JSON lint (if any)
+        if: always() && steps.validate.outcomes == 'success'
+        run: |
+          set -e
+          has_json=0
+          for f in ${{ steps.files.outputs.all_changed_files }}; do
+            if echo "$f" | grep -Ei "\.json$" >/dev/null; then
+              has_json=1
+              jq . "$f" >/dev/null
+            fi
+          done
+          if [ "$has_json" -eq 1 ]; then echo "JSON ok"; fi
+
+      - name: Auto-merge when safe
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo, number} = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: context.payload.pull_request.number
+            };
+            // squash merge + 删除源分支
+            await github.rest.pulls.merge({
+              owner, repo, pull_number: number,
+              merge_method: 'squash'
+            }).catch(e => { core.setFailed(e.message); });
+            await github.rest.git.deleteRef({
+              owner, repo,
+              ref: `heads/${context.payload.pull_request.head.ref}`
+            }).catch(() => {});
