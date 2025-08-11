@@ -67,7 +67,10 @@ jobs:
       - name: Open PR via API
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            // 你现有的脚本不变
+
             const { owner, repo } = context.repo;
             const head = process.env.BRANCH;
             if (!head) { core.setFailed('BRANCH env missing'); return; }
