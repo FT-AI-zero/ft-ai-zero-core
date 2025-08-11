@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created]
 
-# 需要有写权限+开 PR 权限
+# 需要写代码 + 开 PR 权限
 permissions:
   contents: write
   pull-requests: write
@@ -25,17 +25,19 @@ jobs:
         run: |
           python - <<'PY'
           import os,re,json
-          ev=json.load(open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8'))
-          m=re.search(r"```patch\s*(.*?)```", ev["comment"]["body"], re.S|re.I)
+          with open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8') as f:
+              ev = json.load(f)
+          m = re.search(r"```patch\s*(.*?)```", ev["comment"]["body"], re.S|re.I)
           assert m, "No ```patch``` block found in the comment"
-          open("chat.patch","w",encoding="utf-8").write(m.group(1))
+          with open("chat.patch","w",encoding="utf-8") as f:
+              f.write(m.group(1))
           PY
 
       - name: Create branch, apply and push
         run: |
           set -e
           BR="chatpatch-$(date +%s)"
-          echo "BRANCH=$BR" >> $GITHUB_ENV
+          echo "BRANCH=$BR" >> "$GITHUB_ENV"
 
           git config user.name  "chat-bot"
           git config user.email "chat-bot@users.noreply.github.com"
@@ -50,17 +52,22 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const { owner, repo } = context.repo
-            // 自动取仓库默认分支作为 base
-            const repoInfo = await github.repos.get({ owner, repo })
-            const base = repoInfo.data.default_branch
-            const head = process.env.BRANCH
-            if (!head) core.setFailed('BRANCH env missing')
+            const { owner, repo } = context.repo;
 
-            const { data: pr } = await github.pulls.create({
+            // 读取上一步写入到环境变量的分支名
+            const head = process.env.BRANCH;
+            if (!head) { core.setFailed('BRANCH env missing'); return; }
+
+            // 获取默认分支作为 base
+            const info = await github.rest.repos.get({ owner, repo });
+            const base = info.data.default_branch;
+
+            // 创建 PR
+            const pr = await github.rest.pulls.create({
               owner, repo, head, base,
-              title: "Patch from chat",
-              body: "Auto-created from issue comment.",
+              title: 'Patch from chat',
+              body: 'Auto-created from issue comment.',
               maintainer_can_modify: true,
-            })
-            core.info(`PR -> ${pr.html_url}`)
+            });
+
+            core.info(`PR -> ${pr.data.html_url}`);
