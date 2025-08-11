@@ -1,0 +1,222 @@
+name: Nightly Deep Scan
+
+on:
+  schedule:
+    - cron: '30 15 * * *'  # 每天 23:30 Asia/Shanghai，对应 UTC 15:30
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'plan|full'
+        required: false
+        default: 'full'
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: nightly-scan
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    # 允许三种触发；issue_comment 仅限 /nightly 且作者为 OWNER/MEMBER/COLLABORATOR
+    if: >
+      github.event_name != 'issue_comment' ||
+      (
+        contains(github.event.comment.body, '/nightly') &&
+        (
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install scanners & CLIs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cloc tree jq ripgrep
+          pip install -q --disable-pip-version-check \
+            radon bandit flake8 black isort mypy detect-secrets
+
+      - name: Inventory & metrics
+        run: |
+          mkdir -p /tmp/findings
+          # 1) 代码体量与语言分布
+          cloc --json --quiet . > /tmp/findings/cloc.json || true
+          # 2) Python 复杂度
+          radon cc . -s -j > /tmp/findings/radon_cc.json || true
+          # 3) Python 维护指数
+          radon mi . -s -j > /tmp/findings/radon_mi.json || true
+          # 4) 安全扫描
+          bandit -q -r . -f json -o /tmp/findings/bandit.json || true
+          # 5) 代码风格与潜在错误（不阻塞）
+          flake8 . || true
+          black --check . || true
+          isort --check-only . || true
+          mypy . --ignore-missing-imports --install-types --non-interactive || true
+          # 6) 寻找疑似数据/数据库/大文件
+          rg -n --hidden -S -g '!*site-packages*' -e 'sqlite|mysql|postgres|mongodb|redis|clickhouse' > /tmp/findings/db_refs.txt || true
+          rg -n --hidden -S -g '!*site-packages*' -e 'data/|datasets?|\.parquet|\.csv|\.ndjson|\.feather|\.db\b' > /tmp/findings/data_refs.txt || true
+          # 7) 超大文件列表
+          { find . -type f -size +5M -not -path "./.git/*" -printf "%s\t%p\n" | sort -rn | head -100; } > /tmp/findings/large_files.tsv || true
+
+      - name: Generate plan & summary
+        run: |
+          python - <<'PY'
+          import json, os, re, sys, pathlib
+          root = pathlib.Path(".").resolve()
+          F = pathlib.Path("/tmp/findings")
+          def load(p, default=None):
+            try:
+              return json.load(open(p))
+            except Exception:
+              return default
+          cloc = load(F/"cloc.json", {})
+          radon_cc = load(F/"radon_cc.json", {})
+          radon_mi = load(F/"radon_mi.json", {})
+          bandit = load(F/"bandit.json", {"results":[]})
+
+          def read_txt(p): 
+            try: return open(p,"r",encoding="utf-8",errors="ignore").read()
+            except: return ""
+
+          db_refs   = read_txt(F/"db_refs.txt").strip().splitlines()
+          data_refs = read_txt(F/"data_refs.txt").strip().splitlines()
+          large     = read_txt(F/"large_files.tsv").strip().splitlines()
+
+          # 统计复杂度 > 10 的函数/方法
+          hotspots = []
+          for file, items in (radon_cc or {}).items():
+            for it in items:
+              if it.get("complexity", 0) >= 10:
+                hotspots.append({
+                  "file": file,
+                  "name": it.get("name"),
+                  "line": it.get("lineno"),
+                  "complexity": it.get("complexity")
+                })
+          hotspots.sort(key=lambda x: -x["complexity"])
+
+          # 维护指数 MI < 60 视为需要重构优先
+          low_mi = []
+          for file, mi in (radon_mi or {}).items():
+            try:
+              v = float(mi.get("mi", 100))
+            except:
+              continue
+            if v < 60:
+              low_mi.append({"file": file, "mi": v})
+          low_mi.sort(key=lambda x: x["mi"])
+
+          # Bandit 高危
+          high_bandit = [r for r in bandit.get("results",[]) if r.get("issue_severity")=="HIGH"]
+
+          # 生成计划
+          plan = []
+          plan.append("# Nightly 扫描报告与演进计划\n")
+          plan.append("## 仓库概览\n")
+          if "header" in cloc:
+            code_sum = cloc.get("SUM", {})
+            plan.append(f"- 代码行数：{code_sum.get('code','?')}, 文件数：{code_sum.get('nFiles','?')}\n")
+          if "SUM" in cloc:
+            langs = [(k,v.get("code",0)) for k,v in cloc.items() if k not in ("header","SUM")]
+            langs.sort(key=lambda x:-x[1])
+            plan.append("- 语言分布：\n")
+            for k,c in langs[:10]:
+              plan.append(f"  - {k}: {c}\n")
+
+          plan.append("\n## 安全与质量热点\n")
+          plan.append(f"- 高复杂度热点（>=10）Top 20：{len(hotspots)} 处\n")
+          for h in hotspots[:20]:
+            plan.append(f"  - {h['file']}:{h['line']} 复杂度 {h['complexity']} — {h['name']}\n")
+          plan.append(f"- 维护指数低（MI<60）文件：{len(low_mi)} 个（Top 20）\n")
+          for m in low_mi[:20]:
+            plan.append(f"  - {m['file']}  MI={m['mi']:.1f}\n")
+          plan.append(f"- Bandit 高危：{len(high_bandit)} 处（详见 artifact）\n")
+
+          plan.append("\n## 数据/数据库线索\n")
+          plan.append(f"- 可能的数据库引用：{len(db_refs)} 行；数据目录/文件引用：{len(data_refs)} 行\n")
+          if large:
+            plan.append(f"- 超大文件（>5MB）Top 20：\n")
+            for line in large[:20]:
+              sz, path = line.split("\t",1)
+              plan.append(f"  - {int(sz)//(1024*1024)}MB  {path}\n")
+
+          plan.append("\n## 建议的演进路线（分阶段）\n")
+          plan.append("### 阶段 1：稳定性与安全（今晚→明早 PR）\n")
+          plan.append("- [ ] 修复 Bandit 高危/明显 Bug（生成自动补丁）\n")
+          plan.append("- [ ] 引入 CI 质量门禁（flake8/black/isort/radon 阈值）\n")
+          plan.append("- [ ] 大文件与数据目录规范化（/data、/artifacts，Git LFS 可选）\n")
+          plan.append("- [ ] 统一日志与异常处理，关键任务加重试/超时\n")
+          plan.append("\n### 阶段 2：可维护性与解耦（本周内）\n")
+          plan.append("- [ ] 对 MI<60 & 高复杂度热点进行小步重构（函数拆分、去重、纯函数化）\n")
+          plan.append("- [ ] 引入类型约束（mypy 基线），逐模块提升覆盖\n")
+          plan.append("- [ ] 模块边界与依赖收敛，抽象策略/执行引擎/数据层三层\n")
+          plan.append("\n### 阶段 3：无人值守与自进化（两周）\n")
+          plan.append("- [ ] 夜间巡检 + 自动提案（已完成基础），连通“策略回测/对比/择优”流水线\n")
+          plan.append("- [ ] 策略参数自动调优（Bayes/PSO/网格），保存最优快照\n")
+          plan.append("- [ ] 生产参数灰度发布与回滚，异常回补与SLO告警闭环\n")
+
+          # 摘要（回贴用）
+          summary = {
+            "code_lines": cloc.get("SUM",{}).get("code","?"),
+            "files": cloc.get("SUM",{}).get("nFiles","?"),
+            "hotspots": len(hotspots),
+            "low_mi": len(low_mi),
+            "bandit_high": len(high_bandit),
+            "db_refs": len(db_refs),
+            "data_refs": len(data_refs),
+            "large_files": len(large),
+          }
+
+          open("/tmp/plan.md","w",encoding="utf-8").write("\n".join(plan))
+          open("/tmp/summary.json","w",encoding="utf-8").write(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-scan
+          path: |
+            /tmp/findings/
+            /tmp/plan.md
+            /tmp/summary.json
+
+      - name: Comment summary to issue (if /nightly)
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.issue.number;
+            const sum = JSON.parse(fs.readFileSync('/tmp/summary.json','utf8'));
+            const plan = fs.readFileSync('/tmp/plan.md','utf8');
+            const md = [
+              '### ✅ Nightly 扫描完成（摘要）',
+              `- 代码行数：**${sum.code_lines}** ；文件数：**${sum.files}**`,
+              `- 高复杂度热点：**${sum.hotspots}**；低维护指数：**${sum.low_mi}**`,
+              `- Bandit 高危：**${sum.bandit_high}**`,
+              `- DB 引用：**${sum.db_refs}**；数据引用：**${sum.data_refs}**；大文件：**${sum.large_files}**`,
+              '',
+              '> 详见 artifact：**nightly-scan**。以下为路线图草案：',
+              '',
+              plan
+            ].join('\n');
+            await github.rest.issues.createComment({owner, repo, issue_number, body: md});
