@@ -1,0 +1,21 @@
+name: DEBUG Issue Comments
+on:
+  issue_comment:
+    types: [created]
+permissions:
+  contents: read
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show basics
+        run: |
+          echo "Actor=${{ github.actor }}"
+          echo "Action=${{ github.event.action }}"
+          echo "---- Body (first 400 chars) ----"
+          python - <<'PY'
+          import json, os
+          ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          body = ev.get("comment", {}).get("body", "")
+          print(body[:400])
+          PY
