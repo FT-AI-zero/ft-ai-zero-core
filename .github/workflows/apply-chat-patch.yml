@@ -12,7 +12,12 @@ permissions:
 jobs:
   apply:
     # 只有包含 ```patch 的评论才触发
-    if: contains(github.event.comment.body, '```patch')
+    if: |
+      contains(github.event.comment.body, '```patch') &&
+      (github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'OWNER'  ||
+       github.event.comment.author_association == 'COLLABORATOR')
+
     runs-on: ubuntu-latest
 
     steps:
