@@ -1,0 +1,100 @@
+name: Nightly Deep Scan
+
+on:
+  schedule:
+    - cron: '30 2 * * *'   # 每天 02:30 UTC
+  workflow_dispatch:
+  repository_dispatch:
+    types: [nightly-full]
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+concurrency:
+  group: nightly-deep-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff bandit detect-secrets pip-audit
+
+      - name: Ruff (lint only)
+        continue-on-error: true
+        run: ruff check --output-format=github .
+
+      - name: Bandit (security)
+        continue-on-error: true
+        run: bandit -r -q -ll -ii .
+
+      - name: Detect secrets
+        continue-on-error: true
+        run: |
+          detect-secrets scan --all-files > .secrets.json || true
+          echo "---- secrets summary ----"
+          jq '.results | to_entries | length' .secrets.json || echo 0
+
+      - name: Pip audit
+        continue-on-error: true
+        run: pip-audit -r requirements.txt || true
+
+      - name: Gather TODO/FIXME top20
+        run: |
+          set -e
+          grep -RIn -E 'TODO|FIXME|HACK' --exclude-dir=.git --exclude-dir=.github . \
+          | head -n 20 > nightly_todo.txt || true
+          echo "----- top20 -----"
+          cat nightly_todo.txt || true
+
+      - name: Stats
+        run: |
+          echo "FILES=$(git ls-files | wc -l)" >> $GITHUB_ENV
+          echo "PY=$(git ls-files '*.py' | wc -l)" >> $GITHUB_ENV
+          echo "MD=$(git ls-files '*.md' | wc -l)" >> $GITHUB_ENV
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-report
+          path: |
+            .secrets.json
+            nightly_todo.txt
+
+      - name: Post summary to issue #1
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = 1; // patch-inbox
+            const fs = require('fs');
+            function slurp(p){ try { return fs.readFileSync(p,'utf8'); } catch{ return ''; } }
+            const todo = slurp('nightly_todo.txt');
+            let secrets = 0;
+            try {
+              const j = JSON.parse(slurp('.secrets.json')||'{}');
+              secrets = Object.keys(j.results||{}).length;
+            } catch {}
+            const body = [
+              `### 🌙 Nightly Deep Scan`,
+              `- Files: ${process.env.FILES} | .py: ${process.env.PY} | .md: ${process.env.MD}`,
+              `- Secrets findings: **${secrets}** (详见 artifact)`,
+              `- TODO/FIXME Top20:`,
+              '```',
+              todo || '(none)',
+              '```',
+              `> Full artifacts: Actions → nightly-report`
+            ].join('\n');
+            await github.rest.issues.createComment({owner, repo, issue_number, body});
