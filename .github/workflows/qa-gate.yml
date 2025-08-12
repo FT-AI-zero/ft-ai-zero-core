@@ -1,0 +1,43 @@
+*** Begin Patch
+*** Add File: .github/workflows/qa-gate.yml
++name: QA Gate
++on:
++  pull_request:
++    types: [opened, synchronize, reopened]
++permissions:
++  contents: read
++  pull-requests: write
++jobs:
++  qa:
++    runs-on: [self-hosted, zero]
++    steps:
++      - uses: actions/checkout@v4
++        with: { fetch-depth: 0 }
++      - uses: actions/setup-python@v5
++        with: { python-version: "3.11" }
++      - name: Install tools
++        run: |
++          python -m pip install --upgrade pip
++          pip install ruff bandit pip-audit radon
++      - name: Ruff
++        run: ruff check --output-format=github .
++      - name: Bandit
++        run: bandit -r -q -ll -ii .
++      - name: Pip Audit
++        run: pip-audit -r requirements.txt || true
++      - name: Radon CC
++        run: radon cc -n D -s .
++      - name: Path Sentinel (simple)
++        shell: python
++        run: |
++          import re,glob,sys
++          bad=[]
++          for p in glob.glob('**/*.py', recursive=True):
++              try: s=open(p,'r',encoding='utf-8',errors='ignore').read()
++              except: continue
++              if re.search(r'\b(open|read_csv|to_csv)\(', s) and 'core/paths.py' not in p:
++                  bad.append(p)
++          if bad:
++              print('Path violations:', *bad, sep='\n- ')
++              sys.exit(1)
+*** End Patch
