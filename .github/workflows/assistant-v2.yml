@@ -7,10 +7,10 @@ on:
     inputs:
       cmd:
         description: "Command to run"
+        required: false
         type: choice
         options: [diag, path-audit, data-map]
         default: diag
-        required: false
 
 permissions:
   contents: write
@@ -20,13 +20,18 @@ permissions:
 
 jobs:
   handle:
+    # 允许手动触发；也允许 Issue 评论触发（后面步骤再判断具体命令）
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'issue_comment' }}
     runs-on: [self-hosted, zero]
+
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: '3.11'
 
       - name: Parse command
         id: parse
@@ -41,11 +46,11 @@ jobs:
             $b = @"
             ${{ github.event.comment.body }}
             "@.Trim()
-            if ($b -match '^\s*/diag\b') { $cmd='diag' }
+            if ($b -match '^\s*/diag\b')       { $cmd='diag' }
             elseif ($b -match '^\s*/path-audit\b') { $cmd='path-audit' }
-            elseif ($b -match '^\s*/data-map\b') { $cmd='data-map' }
+            elseif ($b -match '^\s*/data-map\b')   { $cmd='data-map' }
           }
-          echo "cmd=$cmd" >> $env:GITHUB_OUTPUT
+          "cmd=$cmd" >> $env:GITHUB_OUTPUT
 
       - name: Run (${{ steps.parse.outputs.cmd }})
         if: steps.parse.outputs.cmd != ''
@@ -53,6 +58,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
           $cmd='${{ steps.parse.outputs.cmd }}'
+
           if ($cmd -eq 'diag') {
             $info = @(
               "Runner: $env:RUNNER_NAME",
@@ -62,12 +68,13 @@ jobs:
               "Repo: $env:GITHUB_REPOSITORY",
               "Ref: $env:GITHUB_REF"
             ) -join "`n"
-            Set-Content reports/diag.txt $info
+            Set-Content reports/diag.txt $info -Encoding UTF8
           }
           elseif ($cmd -eq 'path-audit') {
-            pip install --upgrade pip >$null
+            python -m pip install --upgrade pip >$null
             pip install ruff radon >$null
-@'
+
+            $code = @'
 import re,glob,json
 bad=[]
 PATTERNS=[r'\bopen\(',r'\bread_csv\(',r'\bto_csv\(',r'\bos\.path\.',r'Path\(']
@@ -83,10 +90,13 @@ for p in glob.glob('**/*.py', recursive=True):
     if hits:
         bad.append({"file":p,"hits":len(hits)})
 open('reports/path_audit.json','w',encoding='utf-8').write(json.dumps(bad,indent=2,ensure_ascii=False))
-'@ | python -
+'@
+            $py = Join-Path $PWD 'reports\path_audit.py'
+            Set-Content -Path $py -Value $code -Encoding UTF8
+            python $py
           }
           elseif ($cmd -eq 'data-map') {
-@'
+            $code = @'
 import re,glob,json
 edges=[]
 for p in glob.glob('**/*.py', recursive=True):
@@ -97,7 +107,10 @@ for p in glob.glob('**/*.py', recursive=True):
     for m in re.finditer(r"(?:open|read_csv|to_csv)\((?:'|\")([^'\" ]+)", s):
         edges.append({"file":p,"path":m.group(1)})
 open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent=2,ensure_ascii=False))
-'@ | python -
+'@
+            $py = Join-Path $PWD 'reports\data_map.py'
+            Set-Content -Path $py -Value $code -Encoding UTF8
+            python $py
           }
 
       - name: Upload artifacts
@@ -115,6 +128,8 @@ open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent
             const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}`;
             const cmd = `${{ steps.parse.outputs.cmd }}`;
             await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo, issue_number: 1,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 1,
               body: `✅ **${cmd}** 完成（runner: ${process.env.RUNNER_NAME}）。Artifacts: assistant-v2-${cmd}。\n[查看运行日志](${run})`
             });
