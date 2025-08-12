@@ -4,6 +4,13 @@ on:
   issue_comment:
     types: [created]
   workflow_dispatch:
+    inputs:
+      cmd:
+        description: "Command to run"
+        type: choice
+        options: [diag, path-audit, data-map]
+        default: diag
+        required: false
 
 permissions:
   contents: write
@@ -25,13 +32,19 @@ jobs:
         id: parse
         shell: pwsh
         run: |
-          $b = @"
-          ${{ github.event.comment.body }}
-          "@.Trim()
+          $event = '${{ github.event_name }}'
           $cmd = ''
-          if ($b -match '^\s*/diag\b') { $cmd='diag' }
-          elseif ($b -match '^\s*/path-audit\b') { $cmd='path-audit' }
-          elseif ($b -match '^\s*/data-map\b') { $cmd='data-map' }
+          if ($event -eq 'workflow_dispatch') {
+            $input = '${{ github.event.inputs.cmd }}'
+            if ($input) { $cmd = $input }
+          } else {
+            $b = @"
+            ${{ github.event.comment.body }}
+            "@.Trim()
+            if ($b -match '^\s*/diag\b') { $cmd='diag' }
+            elseif ($b -match '^\s*/path-audit\b') { $cmd='path-audit' }
+            elseif ($b -match '^\s*/data-map\b') { $cmd='data-map' }
+          }
           echo "cmd=$cmd" >> $env:GITHUB_OUTPUT
 
       - name: Run (${{ steps.parse.outputs.cmd }})
