@@ -7,10 +7,10 @@ on:
     inputs:
       cmd:
         description: "Command to run"
-        required: false
         type: choice
         options: [diag, path-audit, data-map]
         default: diag
+        required: false
 
 permissions:
   contents: write
@@ -20,19 +20,15 @@ permissions:
 
 jobs:
   handle:
-    # 允许手动触发；也允许 Issue 评论触发（后面步骤再判断具体命令）
+    # 允许两种触发来源：按钮手动触发 / Issue 评论
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'issue_comment' }}
     runs-on: [self-hosted, zero]
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
+      # 先解析命令：只用 PowerShell，不依赖 Python/网络
       - name: Parse command
         id: parse
         shell: pwsh
@@ -46,90 +42,90 @@ jobs:
             $b = @"
             ${{ github.event.comment.body }}
             "@.Trim()
-            if ($b -match '^\s*/diag\b')       { $cmd='diag' }
+            if ($b -match '^\s*/diag\b') { $cmd='diag' }
             elseif ($b -match '^\s*/path-audit\b') { $cmd='path-audit' }
-            elseif ($b -match '^\s*/data-map\b')   { $cmd='data-map' }
+            elseif ($b -match '^\s*/data-map\b') { $cmd='data-map' }
           }
-          "cmd=$cmd" >> $env:GITHUB_OUTPUT
+          echo "cmd=$cmd" >> $env:GITHUB_OUTPUT
 
-      - name: Run (${{ steps.parse.outputs.cmd }})
-        if: steps.parse.outputs.cmd != ''
+      # 仅当需要运行 Python 脚本时，才安装 Python（避免 /diag 被“安装失败”连累）
+      - name: Setup Python 3.11 (only when needed)
+        if: ${{ steps.parse.outputs.cmd != '' && steps.parse.outputs.cmd != 'diag' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # /diag：不需要 Python、也不需要联网
+      - name: Run (diag)
+        if: ${{ steps.parse.outputs.cmd == 'diag' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
-          $cmd='${{ steps.parse.outputs.cmd }}'
+          $info = @(
+            "Runner: $env:RUNNER_NAME",
+            "OS: $env:RUNNER_OS",
+            "Arch: $env:PROCESSOR_ARCHITECTURE",
+            "WorkDir: $env:GITHUB_WORKSPACE",
+            "Repo: $env:GITHUB_REPOSITORY",
+            "Ref: $env:GITHUB_REF"
+          ) -join "`n"
+          Set-Content reports/diag.txt $info
 
-          if ($cmd -eq 'diag') {
-            $info = @(
-              "Runner: $env:RUNNER_NAME",
-              "OS: $env:RUNNER_OS",
-              "Arch: $env:PROCESSOR_ARCHITECTURE",
-              "WorkDir: $env:GITHUB_WORKSPACE",
-              "Repo: $env:GITHUB_REPOSITORY",
-              "Ref: $env:GITHUB_REF"
-            ) -join "`n"
-            Set-Content reports/diag.txt $info -Encoding UTF8
-          }
-          elseif ($cmd -eq 'path-audit') {
-            python -m pip install --upgrade pip >$null
-            pip install ruff radon >$null
-
-            $code = @'
-import re,glob,json
+      # /path-audit：可能需要网络安装依赖，先尽量只用标准库；若 pip 装不上也能跑
+      - name: Run (path-audit)
+        if: ${{ steps.parse.outputs.cmd == 'path-audit' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+          @'
+import re,glob,json,io,os,sys
 bad=[]
 PATTERNS=[r'\bopen\(',r'\bread_csv\(',r'\bto_csv\(',r'\bos\.path\.',r'Path\(']
 for p in glob.glob('**/*.py', recursive=True):
     try:
-        s=open(p,'r',encoding='utf-8',errors='ignore').read()
+        s=io.open(p,'r',encoding='utf-8',errors='ignore').read()
     except:
         continue
-    hits=[]
-    for pat in PATTERNS:
-        if re.search(pat,s):
-            hits.append(pat)
+    hits=sum(1 for pat in PATTERNS if re.search(pat,s))
     if hits:
-        bad.append({"file":p,"hits":len(hits)})
-open('reports/path_audit.json','w',encoding='utf-8').write(json.dumps(bad,indent=2,ensure_ascii=False))
-'@
-            $py = Join-Path $PWD 'reports\path_audit.py'
-            Set-Content -Path $py -Value $code -Encoding UTF8
-            python $py
-          }
-          elseif ($cmd -eq 'data-map') {
-            $code = @'
-import re,glob,json
+        bad.append({"file":p,"hits":hits})
+io.open('reports/path_audit.json','w',encoding='utf-8').write(json.dumps(bad,indent=2,ensure_ascii=False))
+'@ | python -
+
+      # /data-map：同样只用标准库
+      - name: Run (data-map)
+        if: ${{ steps.parse.outputs.cmd == 'data-map' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+          @'
+import re,glob,json,io
 edges=[]
 for p in glob.glob('**/*.py', recursive=True):
     try:
-        s=open(p,'r',encoding='utf-8',errors='ignore').read()
+        s=io.open(p,'r',encoding='utf-8',errors='ignore').read()
     except:
         continue
     for m in re.finditer(r"(?:open|read_csv|to_csv)\((?:'|\")([^'\" ]+)", s):
         edges.append({"file":p,"path":m.group(1)})
-open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent=2,ensure_ascii=False))
-'@
-            $py = Join-Path $PWD 'reports\data_map.py'
-            Set-Content -Path $py -Value $code -Encoding UTF8
-            python $py
-          }
+io.open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent=2,ensure_ascii=False))
+'@ | python -
 
       - name: Upload artifacts
-        if: steps.parse.outputs.cmd != ''
+        if: ${{ steps.parse.outputs.cmd != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: assistant-v2-${{ steps.parse.outputs.cmd }}
           path: reports
 
       - name: Comment back
-        if: steps.parse.outputs.cmd != ''
+        if: ${{ steps.parse.outputs.cmd != '' && github.event_name == 'issue_comment' }}
         uses: actions/github-script@v7
         with:
           script: |
             const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}`;
             const cmd = `${{ steps.parse.outputs.cmd }}`;
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: 1,
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 1,
               body: `✅ **${cmd}** 完成（runner: ${process.env.RUNNER_NAME}）。Artifacts: assistant-v2-${cmd}。\n[查看运行日志](${run})`
             });
