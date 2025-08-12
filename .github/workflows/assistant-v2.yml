@@ -67,31 +67,37 @@ jobs:
           elseif ($cmd -eq 'path-audit') {
             pip install --upgrade pip >$null
             pip install ruff radon >$null
-            python - << 'PY'
+@'
 import re,glob,json
 bad=[]
 PATTERNS=[r'\bopen\(',r'\bread_csv\(',r'\bto_csv\(',r'\bos\.path\.',r'Path\(']
 for p in glob.glob('**/*.py', recursive=True):
-    try: s=open(p,'r',encoding='utf-8',errors='ignore').read()
-    except: continue
+    try:
+        s=open(p,'r',encoding='utf-8',errors='ignore').read()
+    except:
+        continue
     hits=[]
     for pat in PATTERNS:
-        if re.search(pat,s): hits.append(pat)
-    if hits: bad.append({"file":p,"hits":len(hits)})
+        if re.search(pat,s):
+            hits.append(pat)
+    if hits:
+        bad.append({"file":p,"hits":len(hits)})
 open('reports/path_audit.json','w',encoding='utf-8').write(json.dumps(bad,indent=2,ensure_ascii=False))
-PY
+'@ | python -
           }
           elseif ($cmd -eq 'data-map') {
-            python - << 'PY'
+@'
 import re,glob,json
 edges=[]
 for p in glob.glob('**/*.py', recursive=True):
-    try: s=open(p,'r',encoding='utf-8',errors='ignore').read()
-    except: continue
+    try:
+        s=open(p,'r',encoding='utf-8',errors='ignore').read()
+    except:
+        continue
     for m in re.finditer(r"(?:open|read_csv|to_csv)\((?:'|\")([^'\" ]+)", s):
         edges.append({"file":p,"path":m.group(1)})
 open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent=2,ensure_ascii=False))
-PY
+'@ | python -
           }
 
       - name: Upload artifacts
