@@ -1,11 +1,11 @@
+# .github/workflows/nightly-deep-scan.yml
 name: Nightly Deep Scan
 
 on:
   schedule:
-    - cron: '30 2 * * *'   # 每天 02:30 UTC
+    # 每天 01:30 Asia/Shanghai == 17:30 UTC
+    - cron: '30 17 * * *'
   workflow_dispatch:
-  repository_dispatch:
-    types: [nightly-full]
 
 permissions:
   contents: read
@@ -21,18 +21,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          pip install ruff bandit detect-secrets pip-audit
+          pip install ruff bandit detect-secrets pip-audit radon
 
-      - name: Ruff (lint only)
+      - name: Ruff (lint)
         continue-on-error: true
         run: ruff check --output-format=github .
 
@@ -42,28 +43,20 @@ jobs:
 
       - name: Detect secrets
         continue-on-error: true
-        run: |
-          detect-secrets scan --all-files > .secrets.json || true
-          echo "---- secrets summary ----"
-          jq '.results | to_entries | length' .secrets.json || echo 0
+        run: detect-secrets scan --all-files > .secrets.json || true
 
       - name: Pip audit
         continue-on-error: true
         run: pip-audit -r requirements.txt || true
 
-      - name: Gather TODO/FIXME top20
-        run: |
-          set -e
-          grep -RIn -E 'TODO|FIXME|HACK' --exclude-dir=.git --exclude-dir=.github . \
-          | head -n 20 > nightly_todo.txt || true
-          echo "----- top20 -----"
-          cat nightly_todo.txt || true
+      - name: Radon (complexity)
+        continue-on-error: true
+        run: radon cc -s -a core utils collectors scripts | tee radon.txt
 
-      - name: Stats
+      - name: Gather TODO/FIXME
         run: |
-          echo "FILES=$(git ls-files | wc -l)" >> $GITHUB_ENV
-          echo "PY=$(git ls-files '*.py' | wc -l)" >> $GITHUB_ENV
-          echo "MD=$(git ls-files '*.md' | wc -l)" >> $GITHUB_ENV
+          grep -RIn -E 'TODO|FIXME|HACK' --exclude-dir=.git --exclude-dir=.github . \
+          | head -n 50 > nightly_todo.txt || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -72,29 +65,31 @@ jobs:
           path: |
             .secrets.json
             nightly_todo.txt
+            radon.txt
 
-      - name: Post summary to issue #1
+      - name: Comment summary to issue #1
         uses: actions/github-script@v7
         with:
           script: |
             const {owner, repo} = context.repo;
-            const issue_number = 1; // patch-inbox
+            const issue_number = 1;
             const fs = require('fs');
-            function slurp(p){ try { return fs.readFileSync(p,'utf8'); } catch{ return ''; } }
-            const todo = slurp('nightly_todo.txt');
-            let secrets = 0;
+            const read = p => { try { return fs.readFileSync(p,'utf8'); } catch { return ''; } };
+            let secretsCount = 0;
             try {
-              const j = JSON.parse(slurp('.secrets.json')||'{}');
-              secrets = Object.keys(j.results||{}).length;
+              const j = JSON.parse(read('.secrets.json') || '{}');
+              secretsCount = Object.keys(j.results || {}).length;
             } catch {}
+            const todo  = read('nightly_todo.txt') || '(none)';
+            const radon = (read('radon.txt').split('\n').slice(-1)[0] || '').trim();
             const body = [
-              `### 🌙 Nightly Deep Scan`,
-              `- Files: ${process.env.FILES} | .py: ${process.env.PY} | .md: ${process.env.MD}`,
-              `- Secrets findings: **${secrets}** (详见 artifact)`,
-              `- TODO/FIXME Top20:`,
+              '### 🌙 Nightly Deep Scan',
+              `- Secrets: **${secretsCount}**`,
+              `- Complexity: ${radon}`,
+              '**TODO/FIXME (<=50)**',
               '```',
-              todo || '(none)',
+              todo,
               '```',
-              `> Full artifacts: Actions → nightly-report`
+              '_完整报告见 Artifacts: nightly-report_'
             ].join('\n');
             await github.rest.issues.createComment({owner, repo, issue_number, body});
