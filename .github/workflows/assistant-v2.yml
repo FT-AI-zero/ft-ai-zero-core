@@ -13,11 +13,7 @@ permissions:
 
 jobs:
   handle:
-    # 只响应 Issue #1，并且评论里以 / 开头的命令
-    if: >
-      (github.event_name == 'issue_comment') &&
-      (github.event.issue.number == 1) &&
-      contains(github.event.comment.body, '/')
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.event.issue.number == 1 && startsWith(github.event.comment.body, '/')) }}
     runs-on: [self-hosted, zero]
     steps:
       - uses: actions/checkout@v4
