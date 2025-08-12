@@ -6,11 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       cmd:
-        description: "Command to run"
-        type: choice
-        options: [diag, path-audit, data-map]
-        default: diag
+        description: "Command to run (diag|path-audit|data-map)"
         required: false
+        default: diag
 
 permissions:
   contents: write
@@ -28,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # 先解析命令：只用 PowerShell，不依赖 Python/网络
+      # 只用 PowerShell 解析命令，避免早期步骤就出错
       - name: Parse command
         id: parse
         shell: pwsh
@@ -48,7 +46,7 @@ jobs:
           }
           echo "cmd=$cmd" >> $env:GITHUB_OUTPUT
 
-      # 仅当需要运行 Python 脚本时，才安装 Python（避免 /diag 被“安装失败”连累）
+      # 仅当需要运行 Python 脚本时才安装 Python（/diag 不需要）
       - name: Setup Python 3.11 (only when needed)
         if: ${{ steps.parse.outputs.cmd != '' && steps.parse.outputs.cmd != 'diag' }}
         uses: actions/setup-python@v5
@@ -71,14 +69,14 @@ jobs:
           ) -join "`n"
           Set-Content reports/diag.txt $info
 
-      # /path-audit：可能需要网络安装依赖，先尽量只用标准库；若 pip 装不上也能跑
+      # /path-audit：仅用标准库，避免依赖安装
       - name: Run (path-audit)
         if: ${{ steps.parse.outputs.cmd == 'path-audit' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
           @'
-import re,glob,json,io,os,sys
+import re,glob,json,io
 bad=[]
 PATTERNS=[r'\bopen\(',r'\bread_csv\(',r'\bto_csv\(',r'\bos\.path\.',r'Path\(']
 for p in glob.glob('**/*.py', recursive=True):
