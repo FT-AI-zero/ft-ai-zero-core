@@ -6,9 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       cmd:
-        description: "Command to run (diag|path-audit|data-map)"
-        required: false
+        description: "Command to run"
+        type: choice
+        options: [diag, path-audit, data-map]
         default: diag
+        required: false
 
 permissions:
   contents: write
@@ -18,15 +20,15 @@ permissions:
 
 jobs:
   handle:
-    # 允许两种触发来源：按钮手动触发 / Issue 评论
+    # 允许按钮手动触发 / Issue 评论两种来源
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'issue_comment' }}
     runs-on: [self-hosted, zero]
 
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
-      # 只用 PowerShell 解析命令，避免早期步骤就出错
       - name: Parse command
         id: parse
         shell: pwsh
@@ -46,14 +48,13 @@ jobs:
           }
           echo "cmd=$cmd" >> $env:GITHUB_OUTPUT
 
-      # 仅当需要运行 Python 脚本时才安装 Python（/diag 不需要）
       - name: Setup Python 3.11 (only when needed)
-        if: ${{ steps.parse.outputs.cmd != '' && steps.parse.outputs.cmd != 'diag' }}
+        if: ${{ steps.parse.outputs.cmd == 'path-audit' || steps.parse.outputs.cmd == 'data-map' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # /diag：不需要 Python、也不需要联网
+      # /diag：不依赖 Python
       - name: Run (diag)
         if: ${{ steps.parse.outputs.cmd == 'diag' }}
         shell: pwsh
@@ -67,47 +68,53 @@ jobs:
             "Repo: $env:GITHUB_REPOSITORY",
             "Ref: $env:GITHUB_REF"
           ) -join "`n"
-          Set-Content reports/diag.txt $info
+          Set-Content reports/diag.txt $info -Encoding UTF8
 
-      # /path-audit：仅用标准库，避免依赖安装
+      # /path-audit：只用标准库，避免 here-string 导致的 YAML 解析问题
       - name: Run (path-audit)
         if: ${{ steps.parse.outputs.cmd == 'path-audit' }}
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path reports | Out-Null
-          @'
-import re,glob,json,io
-bad=[]
-PATTERNS=[r'\bopen\(',r'\bread_csv\(',r'\bto_csv\(',r'\bos\.path\.',r'Path\(']
-for p in glob.glob('**/*.py', recursive=True):
-    try:
-        s=io.open(p,'r',encoding='utf-8',errors='ignore').read()
-    except:
-        continue
-    hits=sum(1 for pat in PATTERNS if re.search(pat,s))
-    if hits:
-        bad.append({"file":p,"hits":hits})
-io.open('reports/path_audit.json','w',encoding='utf-8').write(json.dumps(bad,indent=2,ensure_ascii=False))
-'@ | python -
+          set -euo pipefail
+          mkdir -p reports
+          python - <<'PY'
+          import re, glob, json
+          bad = []
+          PATTERNS = [r'\bopen\(', r'\bread_csv\(', r'\bto_csv\(', r'\bos\.path\.', r'Path\(']
+          for p in glob.glob('**/*.py', recursive=True):
+              try:
+                  with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                      s = f.read()
+              except Exception:
+                  continue
+              hits = sum(1 for pat in PATTERNS if re.search(pat, s))
+              if hits:
+                  bad.append({"file": p, "hits": hits})
+          with open('reports/path_audit.json', 'w', encoding='utf-8') as f:
+              json.dump(bad, f, indent=2, ensure_ascii=False)
+          PY
 
       # /data-map：同样只用标准库
       - name: Run (data-map)
         if: ${{ steps.parse.outputs.cmd == 'data-map' }}
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path reports | Out-Null
-          @'
-import re,glob,json,io
-edges=[]
-for p in glob.glob('**/*.py', recursive=True):
-    try:
-        s=io.open(p,'r',encoding='utf-8',errors='ignore').read()
-    except:
-        continue
-    for m in re.finditer(r"(?:open|read_csv|to_csv)\((?:'|\")([^'\" ]+)", s):
-        edges.append({"file":p,"path":m.group(1)})
-io.open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent=2,ensure_ascii=False))
-'@ | python -
+          set -euo pipefail
+          mkdir -p reports
+          python - <<'PY'
+          import re, glob, json
+          edges = []
+          for p in glob.glob('**/*.py', recursive=True):
+              try:
+                  with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                      s = f.read()
+              except Exception:
+                  continue
+              for m in re.finditer(r"(?:open|read_csv|to_csv)\((?:'|\")([^'\" ]+)", s):
+                  edges.append({"file": p, "path": m.group(1)})
+          with open('reports/data_map.json', 'w', encoding='utf-8') as f:
+              json.dump(edges, f, indent=2, ensure_ascii=False)
+          PY
 
       - name: Upload artifacts
         if: ${{ steps.parse.outputs.cmd != '' }}
@@ -124,6 +131,8 @@ io.open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,ind
             const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}`;
             const cmd = `${{ steps.parse.outputs.cmd }}`;
             await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo, issue_number: 1,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 1,
               body: `✅ **${cmd}** 完成（runner: ${process.env.RUNNER_NAME}）。Artifacts: assistant-v2-${cmd}。\n[查看运行日志](${run})`
             });
