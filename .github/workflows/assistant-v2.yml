@@ -14,12 +14,13 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
   issues: write
+  pull-requests: write
   actions: read
 
 jobs:
   handle:
+    # 允许两种触发来源：手动 / Issue 评论
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'issue_comment' }}
     runs-on: [self-hosted, zero]
 
@@ -27,15 +28,13 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # 统一解析命令 + 作用域（central: Issue#1 / dispatch；pr: PR 评论）
+      # 解析命令（仅用 PowerShell，避免早期失败）
       - name: Parse command
         id: parse
         shell: pwsh
         run: |
           $event = '${{ github.event_name }}'
           $cmd = ''
-          $scope = 'central'
-          $pr = ''
           if ($event -eq 'workflow_dispatch') {
             $input = '${{ github.event.inputs.cmd }}'
             if ($input) { $cmd = $input }
@@ -43,26 +42,13 @@ jobs:
             $b = @"
             ${{ github.event.comment.body }}
             "@.Trim()
-            if ($b -match '^\s*/diag\b')       { $cmd='diag' }
+            if ($b -match '^\s*/diag\b') { $cmd='diag' }
             elseif ($b -match '^\s*/path-audit\b') { $cmd='path-audit' }
-            elseif ($b -match '^\s*/data-map\b')   { $cmd='data-map' }
-            elseif ($b -match '^\s*/ruff-fix\b')   { $cmd='ruff-fix' }
-            elseif ($b -match '^\s*/squash\b')     { $cmd='squash' }
-            $pr='${{ github.event.issue.number }}'
-            if ('${{ github.event.issue.pull_request }}' -ne '') { $scope='pr' }
+            elseif ($b -match '^\s*/data-map\b') { $cmd='data-map' }
           }
-          echo "cmd=$cmd"     >> $env:GITHUB_OUTPUT
-          echo "scope=$scope" >> $env:GITHUB_OUTPUT
-          echo "pr=$pr"       >> $env:GITHUB_OUTPUT
+          echo "cmd=$cmd" >> $env:GITHUB_OUTPUT
 
-      # 仅当需要 Python 的时候再装，避免 /diag 受网络影响
-      - name: Setup Python 3.11 (only when needed)
-        if: ${{ steps.parse.outputs.cmd == 'path-audit' || steps.parse.outputs.cmd == 'data-map' || steps.parse.outputs.cmd == 'ruff-fix' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # /diag —— 纯信息汇总
+      # /diag：不需要 Python
       - name: Run (diag)
         if: ${{ steps.parse.outputs.cmd == 'diag' }}
         shell: pwsh
@@ -78,131 +64,61 @@ jobs:
           ) -join "`n"
           Set-Content reports/diag.txt $info
 
-      # /path-audit —— 仅用标准库
+      # /path-audit：纯标准库扫描直连路径/读写
       - name: Run (path-audit)
         if: ${{ steps.parse.outputs.cmd == 'path-audit' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
           @'
-import re,glob,json,io
+import re, glob, json, io
 bad=[]
-PATTERNS=[r'\bopen\(',r'\bread_csv\(',r'\bto_csv\(',r'\bos\.path\.',r'Path\(']
-for p in glob.glob('**/*.py', recursive=True):
+PATTERNS=[r'\bopen\(', r'\bread_csv\(', r'\bto_csv\(', r'\bos\.path\.', r'Path\(']
+for p in glob.glob("**/*.py", recursive=True):
     try:
-        s=io.open(p,'r',encoding='utf-8',errors='ignore').read()
+        s = io.open(p, "r", encoding="utf-8", errors="ignore").read()
     except:
         continue
-    hits=sum(1 for pat in PATTERNS if re.search(pat,s))
+    hits = sum(1 for pat in PATTERNS if re.search(pat, s))
     if hits:
-        bad.append({"file":p,"hits":hits})
-io.open('reports/path_audit.json','w',encoding='utf-8').write(json.dumps(bad,indent=2,ensure_ascii=False))
+        bad.append({"file": p, "hits": hits})
+io.open("reports/path_audit.json", "w", encoding="utf-8").write(json.dumps(bad, indent=2, ensure_ascii=False))
 '@ | python -
 
-      # /data-map —— 仅用标准库
+      # /data-map：抽取 代码文件 ↔ 数据路径 粗粒度映射
       - name: Run (data-map)
         if: ${{ steps.parse.outputs.cmd == 'data-map' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
           @'
-import re,glob,json,io
+import re, glob, json, io
 edges=[]
-for p in glob.glob('**/*.py', recursive=True):
+for p in glob.glob("**/*.py", recursive=True):
     try:
-        s=io.open(p,'r',encoding='utf-8',errors='ignore').read()
+        s = io.open(p, "r", encoding="utf-8", errors="ignore").read()
     except:
         continue
     for m in re.finditer(r"(?:open|read_csv|to_csv)\((?:'|\")([^'\" ]+)", s):
-        edges.append({"file":p,"path":m.group(1)})
-io.open('reports/data_map.json','w',encoding='utf-8').write(json.dumps(edges,indent=2,ensure_ascii=False))
+        edges.append({"file": p, "path": m.group(1)})
+io.open("reports/data_map.json", "w", encoding="utf-8").write(json.dumps(edges, indent=2, ensure_ascii=False))
 '@ | python -
 
-      # /ruff-fix —— 只能在 PR 下执行
-      - name: Guard (ruff-fix only in PR)
-        if: ${{ steps.parse.outputs.cmd == 'ruff-fix' && steps.parse.outputs.scope != 'pr' }}
-        shell: pwsh
-        run: |
-          Write-Host "ruff-fix 只能在 PR 评论中使用"
-          exit 1
-
-      - name: Ruff auto-fix on PR branch
-        if: ${{ steps.parse.outputs.cmd == 'ruff-fix' && steps.parse.outputs.scope == 'pr' }}
-        shell: pwsh
-        run: |
-          git config user.name  "repo-assistant-bot"
-          git config user.email "actions@users.noreply.github.com"
-          python -m pip install --upgrade pip
-          pip install ruff || (Write-Host "pip 安装 ruff 失败"; exit 1)
-          ruff --version
-          ruff check --fix .
-          ruff format .
-          $status = git status --porcelain
-          if ($status) {
-            git add -A
-            git commit -m "chore(ruff): auto-fix style"
-            git push
-            Write-Host "Pushed ruff fixes."
-          } else {
-            Write-Host "No changes after ruff."
-          }
-
-      # /squash —— 只能在 PR 下执行
-      - name: Guard (squash only in PR)
-        if: ${{ steps.parse.outputs.cmd == 'squash' && steps.parse.outputs.scope != 'pr' }}
-        shell: pwsh
-        run: |
-          Write-Host "squash 只能在 PR 评论中使用"
-          exit 1
-
-      - name: Squash merge the PR
-        if: ${{ steps.parse.outputs.cmd == 'squash' && steps.parse.outputs.scope == 'pr' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const pr = Number(`${{ steps.parse.outputs.pr }}`);
-            const {owner, repo} = context.repo;
-            try {
-              const { data: prData } = await github.rest.pulls.get({ owner, repo, pull_number: pr });
-              if (!prData.mergeable_state || prData.mergeable_state === 'dirty') {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: pr,
-                  body: "❌ 当前 PR 不能直接合并（冲突或检查未通过）。请先处理再试。"
-                });
-                return;
-              }
-              await github.rest.pulls.merge({
-                owner, repo, pull_number: pr, merge_method: 'squash'
-              });
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: pr,
-                body: "✅ 已使用 **squash** 合并该 PR。"
-              });
-            } catch (e) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: pr,
-                body: `❌ 合并失败：${e.message}`
-              });
-              core.setFailed(e.message);
-            }
-
-      # 只为会产出 reports 的命令上传制品
       - name: Upload artifacts
-        if: ${{ contains('diag,path-audit,data-map', steps.parse.outputs.cmd) }}
+        if: ${{ steps.parse.outputs.cmd != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: assistant-v2-${{ steps.parse.outputs.cmd }}
           path: reports
 
-      # 对 Issue/PR 评论回执
-      - name: Comment back (central cmds)
-        if: ${{ github.event_name == 'issue_comment' && contains('diag,path-audit,data-map', steps.parse.outputs.cmd) }}
+      - name: Comment back
+        if: ${{ steps.parse.outputs.cmd != '' && github.event_name == 'issue_comment' }}
         uses: actions/github-script@v7
         with:
           script: |
             const run = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}`;
             const cmd = `${{ steps.parse.outputs.cmd }}`;
             await github.rest.issues.createComment({
-              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: 1,
               body: `✅ **${cmd}** 完成（runner: ${process.env.RUNNER_NAME}）。Artifacts: assistant-v2-${cmd}。\n[查看运行日志](${run})`
-            })
+            });
